@@ -1,0 +1,27 @@
+# Core deep learning framework
+torch>=2.0.0
+
+# Hugging Face ecosystem for models, tokenizers, and acceleration
+transformers>=4.40.0
+accelerate>=0.29.0
+datasets>=2.18.0
+huggingface_hub>=0.16.0
+# Additional libraries for data processing and model evaluation
+scikit-learn>=1.2.0
+pandas>=1.5.0
+numpy>=1.23.0
+# For handling audio data
+torchaudio>=2.0.0
+# For handling image data
+torchvision>=0.15.0
+# For handling text data
+tokenizers>=0.14.0
+# For numerical operations and scientific computing
+scipy>=1.10.0
+# For data loading and manipulation
+pillow>=9.0.0
+# For logging and visualization
+tensorboard>=2.10.0
+
+# Utility for progress bars
+tqdm>=4.66.0

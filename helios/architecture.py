@@ -364,3 +364,63 @@ class HeliosArchitecture(nn.Module):
                 attention_mask = torch.cat([attention_mask, pad], dim=1)
         return input_ids
 
+    # -----------------------------
+    # 参数分组与冻结控制（供 Trainer 使用）
+    # -----------------------------
+    def edges_parameters(self):
+        """
+        返回所有“边”与门控相关的参数迭代器：EdgeAdapter 模块 + 研究/风控门控线性层。
+        （这些是 Phase-1 仅训练的部分。）
+        """
+        modules = [
+            self.edge_bull_to_bear, self.edge_bear_to_bull,
+            self.edge_bull_to_trader, self.edge_bear_to_trader,
+            self.edge_trader_to_fm, self.edge_riskmix_to_fm,
+            self.research_gate, self.risk_gate,
+        ]
+        modules.extend(list(self.edge_src_to_analyst.values()))
+        modules.extend(list(self.edge_analyst_to_bull.values()))
+        modules.extend(list(self.edge_analyst_to_bear.values()))
+        modules.extend(list(self.edge_analyst_to_trader.values()))
+        modules.extend(list(self.edge_trader_to_risk.values()))
+        modules.extend(list(self.edge_risk_pair.values()))
+
+        for m in modules:
+            for p in m.parameters():
+                yield p
+
+    def vertices_parameters(self):
+        """
+        返回图中“顶点”相关的参数：
+        - 核心 Transformer（共享于所有 AgentNode）
+        - 各 AgentNode/EmbeddingNode/LMHeadNode 上的小型层（例如 LayerNorm, lm_head）
+        - 决策归一化层
+        """
+        # 核心 Transformer 与 lm_head
+        for p in self.core.transformer.parameters():
+            yield p
+        for p in self.core.lm_head.parameters():
+            yield p
+
+        # 节点自身的小层
+        for p in self.src.parameters():
+            yield p
+        for node in self.roles.values():
+            for p in node.parameters():
+                yield p
+        for p in self.dst.parameters():
+            yield p
+        for p in self.decision_norm.parameters():
+            yield p
+
+    def freeze_vertices(self):
+        """冻结顶点（核心与节点）的参数，仅训练边相关参数。"""
+        for p in self.vertices_parameters():
+            p.requires_grad = False
+        for p in self.edges_parameters():
+            p.requires_grad = True
+
+    def unfreeze_vertices(self):
+        """解冻顶点，允许同时训练边与顶点。"""
+        for p in self.vertices_parameters():
+            p.requires_grad = True

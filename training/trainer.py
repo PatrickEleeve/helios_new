@@ -94,6 +94,8 @@ class TrainConfig:
     research_rounds: int = 3
     risk_rounds: int = 3
     use_edges: bool = True
+    # 内存优化
+    gradient_checkpointing: bool = True
 
 def set_seed(seed: int):
     random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -179,6 +181,7 @@ class Trainer:
             torch_dtype=dtype,
             trust_remote_code=cfg.trust_remote_code,
             flow=flow,
+            gradient_checkpointing=cfg.gradient_checkpointing,
         )
         self.tok = self.arch.tokenizer
 
@@ -381,4 +384,3 @@ def run_training(train_file: str, eval_file: Optional[str] = None, field: Option
     print(f"[cfg] {cfg}")
     trainer = Trainer(cfg, train_texts, eval_texts)
     trainer.train()
-

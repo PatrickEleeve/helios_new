@@ -88,7 +88,7 @@ def greedy_decode(arch: HeliosArchitecture, prompt: str, max_new: int = 64) -> s
     return tail
 
 @torch.no_grad()
-def rank_choices(arch: HeliosArchitecture, prompt: str, choices: List[str]) -> str:
+def rank_choices(arch: HeliosArchitecture, prompt: str, choices: List[str], score_norm: str = "none") -> str:
     """
     P(choice | prompt) 逐token打分，返回分数最高者。适合 BUY/HOLD/SELL。
     """
@@ -109,6 +109,8 @@ def rank_choices(arch: HeliosArchitecture, prompt: str, choices: List[str]) -> s
             ctx_ids = torch.cat([ctx_ids, tid_.to(ctx_ids.device)], dim=1)
             one = torch.ones((ctx_attn.size(0),1), dtype=ctx_attn.dtype, device=ctx_attn.device)
             ctx_attn = torch.cat([ctx_attn, one], dim=1)
+        if score_norm == "length" and len(ch_ids) > 0:
+            logp = logp / len(ch_ids)
         scores.append(logp)
     best_idx = int(torch.tensor(scores).argmax().item())
     return choices[best_idx]
@@ -149,6 +151,7 @@ def main():
     ap.add_argument("--risk-rounds", type=int, default=3)
     ap.add_argument("--choice-mode", choices=["none","rank","constrained"], default="rank",
                     help="rank=对候选打分；constrained=受限首token；none=普通生成")
+    ap.add_argument("--score-norm", choices=["none","length"], default="none", help="rank模式分数归一化方式")
     ap.add_argument("--choice-set", type=str, default="BUY,HOLD,SELL")
     ap.add_argument("--prompt", type=str, help="单条测试：建议在 Decision: 后留空格")
     ap.add_argument("--file", type=str, help="批量测试：jsonl，每行包含 {\"text\": ...}")
@@ -172,7 +175,7 @@ def main():
     if args.prompt:
         prompt, _, _ = split_prompt(args.prompt, args.prefix)
         if args.choice_mode == "rank":
-            print(rank_choices(arch, prompt, choices)); return
+            print(rank_choices(arch, prompt, choices, score_norm=args.score_norm)); return
         if args.choice_mode == "constrained":
             print(constrained_first_token(arch, prompt, choices)); return
         print(greedy_decode(arch, prompt, max_new=args.max_new)); return
@@ -190,7 +193,7 @@ def main():
     batch_preds = []
     for p,_ in raw_prompts:
         if args.choice_mode == "rank":
-            batch_preds.append(rank_choices(arch, p, choices))
+            batch_preds.append(rank_choices(arch, p, choices, score_norm=args.score_norm))
         elif args.choice_mode == "constrained":
             batch_preds.append(constrained_first_token(arch, p, choices))
         else:
@@ -204,7 +207,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

@@ -43,6 +43,10 @@ def main():
     parser.add_argument("--generate-data", action="store_true", help="先生成合成交易场景数据")
     parser.add_argument("--n-train", type=int, default=2000)
     parser.add_argument("--n-eval", type=int, default=300)
+    # 低显存可选覆盖项（不改变默认配置）
+    parser.add_argument("--max-seq-len", type=int, default=None, help="覆盖实验配置的 max_seq_len")
+    parser.add_argument("--research-rounds", type=int, default=None, help="覆盖 research_rounds")
+    parser.add_argument("--risk-rounds", type=int, default=None, help="覆盖 risk_rounds")
     args = parser.parse_args()
 
     if args.generate_data:
@@ -54,6 +58,13 @@ def main():
 
     cfg, train_file, eval_file, field = get_experiment()
     cfg = _ensure_arch_methods(cfg)
+    # 按需覆盖以降低显存占用（仅当显式传参时生效）
+    if args.max_seq_len is not None:
+        cfg.max_seq_len = int(args.max_seq_len)
+    if args.research_rounds is not None:
+        cfg.research_rounds = int(args.research_rounds)
+    if args.risk_rounds is not None:
+        cfg.risk_rounds = int(args.risk_rounds)
     run_training(train_file=train_file, eval_file=eval_file, field=field, cfg=cfg)
 
 if __name__ == "__main__":

@@ -2,14 +2,23 @@
 from __future__ import annotations
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from .adapters import EdgeAdapter
 from .agents import HFCoreWrapper, EmbeddingNode, AgentNode, LMHeadNode
-from .protocols import Role, RoleConfig, FlowConfig, DenseMode
+from .protocols import Role, FlowConfig, DenseMode
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-8B"
+
+SECTION_TAGS = {
+    Role.ANALYST_FUND: "[FUND]",
+    Role.ANALYST_SENT: "[SENT]",
+    Role.ANALYST_NEWS: "[NEWS]",
+    Role.ANALYST_TECH: "[TECH]",
+    # 可选：通用头部
+    "SNAPSHOT": "[SNAPSHOT]",
+}
 
 class HeliosArchitecture(nn.Module):
     def __init__(
@@ -18,11 +27,17 @@ class HeliosArchitecture(nn.Module):
         device_map: str | dict | None = "auto",
         torch_dtype: Optional[torch.dtype] = torch.bfloat16,
         trust_remote_code: bool = True,
+        # 为兼容旧调用
+        middle_nodes: Optional[int] = None,
+        use_edges: Optional[bool] = None,
+        # 正式配置
         flow: Optional[FlowConfig] = None,
         gradient_checkpointing: bool = False,
         edge_nhead: int = 8,
         edge_ffn_mult: int = 4,
         edge_dropout: float = 0.0,
+        # 新增：是否对 Analyst 启用“分区掩码”
+        enforce_analyst_section_masks: bool = True,
     ):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
@@ -36,33 +51,36 @@ class HeliosArchitecture(nn.Module):
         self.h = self.core.hidden_size
 
         self.flow = flow or FlowConfig()
+        if use_edges is not None:
+            self.flow.use_edges = bool(use_edges)
         self.use_edges = bool(self.flow.use_edges)
         self.dense_mode = self.flow.dense_mode
+        self.enforce_masks = enforce_analyst_section_masks
 
         # ---- 节点 ----
         self.src = EmbeddingNode(self.core)
 
-        def _mk_role(rc: Role) -> AgentNode:
+        def _mk_role() -> AgentNode:
             return AgentNode(self.core)
 
         # Analysts 4
         self.roles: Dict[Role, AgentNode] = {}
         for r in self.flow.analyst_roles():
-            self.roles[r] = _mk_role(r)
+            self.roles[r] = _mk_role()
 
         # Researchers 2
         for r in self.flow.researcher_roles():
-            self.roles[r] = _mk_role(r)
+            self.roles[r] = _mk_role()
 
-        # Trader 1
-        self.roles[Role.TRADER] = _mk_role(Role.TRADER)
+        # Trader
+        self.roles[Role.TRADER] = _mk_role()
 
         # Risk 3
         for r in self.flow.risk_roles():
-            self.roles[r] = _mk_role(r)
+            self.roles[r] = _mk_role()
 
         # Fund Manager
-        self.roles[Role.FUND_MANAGER] = _mk_role(Role.FUND_MANAGER)
+        self.roles[Role.FUND_MANAGER] = _mk_role()
 
         # 输出头
         self.decision_norm = nn.LayerNorm(self.h)
@@ -71,10 +89,10 @@ class HeliosArchitecture(nn.Module):
         # ---- 边（EdgeAdapter）----
         def EA(): return EdgeAdapter(self.h, self.h, nhead=edge_nhead, ffn_mult=edge_ffn_mult, dropout=edge_dropout)
 
-        # src -> Analysts
+        # src -> Analyst（每个分析师各一条；但输入会先被“分区掩码”裁剪）
         self.edge_src_to_analyst = nn.ModuleDict({r.value: EA() for r in self.flow.analyst_roles()})
 
-        # Analysts -> Researchers (共享一条聚合边或各自一条；此处各自一条，再在接收端求和)
+        # Analyst -> Researchers（逐分析师单独路由）
         self.edge_analyst_to_bull = nn.ModuleDict({r.value: EA() for r in self.flow.analyst_roles()})
         self.edge_analyst_to_bear = nn.ModuleDict({r.value: EA() for r in self.flow.analyst_roles()})
 
@@ -85,9 +103,10 @@ class HeliosArchitecture(nn.Module):
         # Researchers -> Trader
         self.edge_bull_to_trader = EA()
         self.edge_bear_to_trader = EA()
+        # Analyst -> Trader（逐分析师）
         self.edge_analyst_to_trader = nn.ModuleDict({r.value: EA() for r in self.flow.analyst_roles()})
 
-        # Trader -> Risk (三路)
+        # Trader -> Risk（每个风险节点一条）
         self.edge_trader_to_risk = nn.ModuleDict({r.value: EA() for r in self.flow.risk_roles()})
 
         # Risk 三方全连接（不含自环）
@@ -98,13 +117,13 @@ class HeliosArchitecture(nn.Module):
                 if i == j: continue
                 self.edge_risk_pair[f"{risk_list[i].value}->{risk_list[j].value}"] = EA()
 
-        # Trader & Risk -> FundManager
+        # Trader & RiskMix -> FundManager
         self.edge_trader_to_fm = EA()
         self.edge_riskmix_to_fm = EA()
 
-        # ---- 主持门控：研究员 2 类 + 风控 3 类 ----
-        self.research_gate = nn.Linear(self.h, 2, bias=False)  # [bull,bear]
-        self.risk_gate = nn.Linear(self.h, 3, bias=False)      # [risky,neutral,safe]
+        # 主持门控：研究员 2 类 + 风控 3 类
+        self.research_gate = nn.Linear(self.h, 2, bias=False)
+        self.risk_gate = nn.Linear(self.h, 3, bias=False)
 
         self._place_custom_modules()
 
@@ -123,30 +142,85 @@ class HeliosArchitecture(nn.Module):
         ]:
             md.to(device=dev, dtype=dt)
 
-    # 训练阶段控制（与 trainer 接口一致）
-    def freeze_vertices(self):
-        for p in self.core.parameters(): p.requires_grad_(False)
-        for p in self.decision_norm.parameters(): p.requires_grad_(False)
+    # ---------- 实用：按标签切分区间并构造掩码 ----------
+    def _find_section_spans(
+        self, input_ids: torch.Tensor
+    ) -> Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        返回每个标签的起止位置（闭区间）列表（按 batch 展开）。
+        约定：标签格式为独立 token（例如 [FUND]），段落覆盖从该标签到下一个标签/结尾为止。
+        """
+        B, T = input_ids.shape
+        tags = {k: self.tokenizer.encode(v, add_special_tokens=False)[0] for k, v in SECTION_TAGS.items()}
+        spans = {k: [] for k in tags.keys()}
 
-    def unfreeze_vertices(self):
-        for p in self.core.parameters(): p.requires_grad_(True)
-        for p in self.decision_norm.parameters(): p.requires_grad_(True)
+        # 先找到每个位置是否为任一标签
+        tag_pos = {k: (input_ids == tid) for k, tid in tags.items()}  # [B,T] bool
 
-    def edges_parameters(self):
-        for md in [
-            self.edge_src_to_analyst, self.edge_analyst_to_bull, self.edge_analyst_to_bear,
-            self.edge_bull_to_bear, self.edge_bear_to_bull, self.edge_bull_to_trader, self.edge_bear_to_trader,
-            self.edge_analyst_to_trader, self.edge_trader_to_risk, self.edge_risk_pair,
-            self.edge_trader_to_fm, self.edge_riskmix_to_fm, self.research_gate, self.risk_gate
+        # 对每个 batch，按出现顺序切段
+        for b in range(B):
+            positions = []
+            for name, mask in tag_pos.items():
+                idxs = torch.nonzero(mask[b], as_tuple=False).flatten()
+                for i in idxs:
+                    positions.append((int(i.item()), name))
+            if not positions:
+                continue
+            positions.sort(key=lambda x: x[0])
+            for i, (start, name) in enumerate(positions):
+                end = (positions[i+1][0] - 1) if i+1 < len(positions) else (T - 1)
+                spans[name].append((torch.tensor(b), torch.tensor(start), torch.tensor(end)))
+        return spans
+
+    def _build_analyst_masks(
+        self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]
+    ) -> Dict[Role, torch.Tensor]:
+        """
+        为每位 Analyst 生成 [B,T,1] 掩码：属于该段=1，其它=0；若该段缺失，退化为使用 [SNAPSHOT] 段。
+        """
+        B, T = input_ids.shape
+        spans = self._find_section_spans(input_ids)
+        masks: Dict[Role, torch.Tensor] = {}
+
+        def make_mask(tag_name: str) -> torch.Tensor:
+            m = torch.zeros((B, T), dtype=torch.bool, device=input_ids.device)
+            for (b, s, e) in spans.get(tag_name, []):
+                b = int(b.item()); s = int(s.item()); e = int(e.item())
+                m[b, s:e+1] = True
+            return m
+
+        snap_m = make_mask("SNAPSHOT")
+        for role, tag in [
+            (Role.ANALYST_FUND, "ANALYST_FUND"),
+            (Role.ANALYST_SENT, "ANALYST_SENT"),
+            (Role.ANALYST_NEWS, "ANALYST_NEWS"),
+            (Role.ANALYST_TECH, "ANALYST_TECH"),
         ]:
-            for p in md.parameters():
-                if p.requires_grad: yield p
+            # 映射 tag key
+            tag_key = role
+            tag_name = tag_key  # Role → key
+            # 取对应段；若为空则用 SNAPSHOT 段
+            role_tag = SECTION_TAGS[role]
+            m_role = make_mask(role_tag.strip("[]"))
+            # 兼容：上面 make_mask 用 key 名，这里做一次 fallback
+            if not m_role.any():
+                m_role = snap_m
+            # 应用 attention_mask（pad 位置强制0）
+            if attention_mask is not None:
+                m_role = m_role & (attention_mask.bool())
+            masks[role] = m_role.unsqueeze(-1).to(dtype=torch.float32)  # [B,T,1]
+        return masks
 
-    def vertices_parameters(self):
-        for p in self.core.parameters():
-            if p.requires_grad: yield p
-        for p in self.decision_norm.parameters():
-            if p.requires_grad: yield p
+    # ---- 辅助：取最后一个非 PAD token 的向量 ----
+    @staticmethod
+    def _pool_last_nonpad(h: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        # h: [B, T, C], attention_mask: [B, T] (1=real, 0=pad)
+        if attention_mask is None:
+            return h[:, -1, :]
+        lengths = attention_mask.sum(dim=-1)  # [B]
+        idx = (lengths - 1).clamp(min=0).to(torch.long)  # [B]
+        B = h.size(0)
+        return h[torch.arange(B, device=h.device), idx, :]  # [B, C]
 
     # --- 前向 ---
     def forward(
@@ -157,61 +231,69 @@ class HeliosArchitecture(nn.Module):
         return_hidden: bool = False,
     ) -> Dict[str, torch.Tensor]:
 
-        # src
+        # 1) t=0 明文 → embedding
         h_src = self.src(input_ids, attention_mask=attention_mask, position_ids=position_ids)  # [B,T,C]
 
-        # Analysts: src -> each analyst -> node
+        # 2) Analyst 分区掩码：每位分析师只看自己的实时数据（段内 token）
+        if self.enforce_masks:
+            masks = self._build_analyst_masks(input_ids, attention_mask)  # [B,T,1] for each role
+        else:
+            masks = {r: torch.ones_like(h_src[..., :1]) for r in self.flow.analyst_roles()}
+
+        # 3) Analysts：分区裁剪后的隐藏态 → 对应边 → 角色节点
         h_analysts: Dict[Role, torch.Tensor] = {}
         for r in self.flow.analyst_roles():
-            h0 = self.edge_src_to_analyst[r.value](h_src, attention_mask) if self.use_edges else h_src
-            h_analysts[r] = self.roles[r](h0, attention_mask=attention_mask, position_ids=position_ids)
+            # 只保留该段 token 的向量（其他位置为0）；确保掩码与隐藏态同精度，避免 dtype 提升
+            h_masked = h_src * masks[r].to(dtype=h_src.dtype)
+            hin = self.edge_src_to_analyst[r.value](h_masked, attention_mask) if self.use_edges else h_masked
+            h_analysts[r] = self.roles[r](hin, attention_mask=attention_mask, position_ids=position_ids)
 
-        # 聚合分析师态（求和）
-        h_analyst_sum = torch.stack(list(h_analysts.values()), dim=0).sum(dim=0)
-
-        # Researchers 初始化：Analyst -> Bull/Bear
+        # 4) Researchers 初始化：逐分析师路由到 Bull / Bear，然后在接收端求和
         def agg_from(md: nn.ModuleDict) -> torch.Tensor:
-            hs = []
+            outs = []
             for r in self.flow.analyst_roles():
-                hs.append(md[r.value](h_analyst_sum, attention_mask) if self.use_edges else h_analyst_sum)
-            return torch.stack(hs, 0).sum(0)
+                x = h_analysts[r]
+                outs.append(md[r.value](x, attention_mask) if self.use_edges else x)
+            return torch.stack(outs, dim=0).sum(dim=0)
 
-        h_bull = self.roles[Role.RESEARCH_BULL](agg_from(self.edge_analyst_to_bull),
-                                                attention_mask=attention_mask, position_ids=position_ids)
-        h_bear = self.roles[Role.RESEARCH_BEAR](agg_from(self.edge_analyst_to_bear),
-                                                attention_mask=attention_mask, position_ids=position_ids)
+        h_bull = self.roles[self.flow.researcher_roles()[0]](
+            agg_from(self.edge_analyst_to_bull), attention_mask=attention_mask, position_ids=position_ids
+        )
+        h_bear = self.roles[self.flow.researcher_roles()[1]](
+            agg_from(self.edge_analyst_to_bear), attention_mask=attention_mask, position_ids=position_ids
+        )
 
-        # n 轮研究员“辩论” = 双向隐藏态互传 + 再过各自 node
+        # 5) n 轮研究员互传
         for _ in range(self.flow.debate.n_research_rounds - 1):
-            h_b2b = self.edge_bull_to_bear(h_bull, attention_mask) if self.use_edges else h_bull
-            h_be2b = self.edge_bear_to_bull(h_bear, attention_mask) if self.use_edges else h_bear
-            h_bear = self.roles[Role.RESEARCH_BEAR](h_bear + h_b2b, attention_mask=attention_mask, position_ids=position_ids)
-            h_bull = self.roles[Role.RESEARCH_BULL](h_bull + h_be2b, attention_mask=attention_mask, position_ids=position_ids)
+            b2be = self.edge_bull_to_bear(h_bull, attention_mask) if self.use_edges else h_bull
+            be2b = self.edge_bear_to_bull(h_bear, attention_mask) if self.use_edges else h_bear
+            h_bear = self.roles[self.flow.researcher_roles()[1]](h_bear + b2be, attention_mask=attention_mask, position_ids=position_ids)
+            h_bull = self.roles[self.flow.researcher_roles()[0]](h_bull + be2b, attention_mask=attention_mask, position_ids=position_ids)
 
-        # 主持裁决（向量门控）：对各自平均池化后打分 softmax
-        def pool_last(h: torch.Tensor):  # [B,T,C] -> [B,C]（末 token）
-            return h[:, -1, :]
-
-        gate_logits = self.research_gate(pool_last(h_bull) + pool_last(h_bear))  # 简单共享门控
-        w = torch.softmax(gate_logits, dim=-1)  # [B,2]
+        # 6) 研究主持门控（最后一个非 PAD token）
+        rb = self._pool_last_nonpad(h_bull, attention_mask)
+        rr = self._pool_last_nonpad(h_bear, attention_mask)
+        gate_logits = self.research_gate(rb + rr)       # [B,2]
+        w = torch.softmax(gate_logits, dim=-1)           # [B,2]
         h_research = (w[:, 0].unsqueeze(1).unsqueeze(2) * h_bull) + (w[:, 1].unsqueeze(1).unsqueeze(2) * h_bear)
 
-        # Trader：来自 Analysts 与 Research
+        # 7) Trader：来自各 analyst（逐条边） + bull/bear
         h_tr_in = []
         for r in self.flow.analyst_roles():
-            h_tr_in.append(self.edge_analyst_to_trader[r.value](h_analyst_sum, attention_mask) if self.use_edges else h_analyst_sum)
+            x = h_analysts[r]
+            h_tr_in.append(self.edge_analyst_to_trader[r.value](x, attention_mask) if self.use_edges else x)
         h_tr_in.append(self.edge_bull_to_trader(h_bull, attention_mask) if self.use_edges else h_bull)
         h_tr_in.append(self.edge_bear_to_trader(h_bear, attention_mask) if self.use_edges else h_bear)
         h_trader = self.roles[Role.TRADER](torch.stack(h_tr_in, 0).sum(0),
                                            attention_mask=attention_mask, position_ids=position_ids)
 
-        # Risk 三节点：由 Trader 初始化
+        # 8) Risk 三节点初始化（由 Trader 态）
         h_risk: Dict[Role, torch.Tensor] = {}
         for r in self.flow.risk_roles():
             hin = self.edge_trader_to_risk[r.value](h_trader, attention_mask) if self.use_edges else h_trader
             h_risk[r] = self.roles[r](hin, attention_mask=attention_mask, position_ids=position_ids)
 
-        # n 轮风控“讨论”：三方全连接互传
+        # 9) n 轮风控互传
         for _ in range(self.flow.debate.n_risk_rounds - 1):
             new_states = {}
             for r_tgt in self.flow.risk_roles():
@@ -223,10 +305,10 @@ class HeliosArchitecture(nn.Module):
                 new_states[r_tgt] = self.roles[r_tgt](acc, attention_mask=attention_mask, position_ids=position_ids)
             h_risk = new_states
 
-        # 风控主持门控（三类 softmax）
-        risk_pooled = sum([pool_last(h) for h in h_risk.values()])  # 简单共享门控
-        rlogits = self.risk_gate(risk_pooled)  # [B,3]
-        rw = torch.softmax(rlogits, dim=-1)
+        # 10) 风控主持门控
+        rp = sum([self._pool_last_nonpad(h, attention_mask) for h in h_risk.values()])
+        rlogits = self.risk_gate(rp)        # [B,3]
+        rw = torch.softmax(rlogits, dim=-1) # [B,3]
         roles = self.flow.risk_roles()
         h_risk_mix = (
             rw[:, 0].unsqueeze(1).unsqueeze(2) * h_risk[roles[0]] +
@@ -234,12 +316,12 @@ class HeliosArchitecture(nn.Module):
             rw[:, 2].unsqueeze(1).unsqueeze(2) * h_risk[roles[2]]
         )
 
-        # Fund Manager：Trader + 风控合成
+        # 11) Fund Manager：Trader + 风控合成
         h_fm_in = (self.edge_trader_to_fm(h_trader, attention_mask) if self.use_edges else h_trader) + \
                   (self.edge_riskmix_to_fm(h_risk_mix, attention_mask) if self.use_edges else h_risk_mix)
         h_fm = self.roles[Role.FUND_MANAGER](h_fm_in, attention_mask=attention_mask, position_ids=position_ids)
 
-        # 归一化后接 LMHead
+        # 12) 输出自然语言
         h_dec = self.decision_norm(h_fm)
         logits = self.dst(h_dec)
 
@@ -256,10 +338,8 @@ class HeliosArchitecture(nn.Module):
             })
         return out
 
-    # 与 trainer/evaluate_text 兼容的接口
-    def compute_lm_loss(
-        self, input_ids, labels, attention_mask=None, position_ids=None, ignore_index=None
-    ):
+    # 与 trainer/evaluate_text 兼容
+    def compute_lm_loss(self, input_ids, labels, attention_mask=None, position_ids=None, ignore_index=None):
         if ignore_index is None:
             ignore_index = self.tokenizer.pad_token_id
         out = self.forward(input_ids, attention_mask=attention_mask, position_ids=position_ids)

@@ -12,7 +12,7 @@ PROCESSED_DIR = DATA_DIR / "processed"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 # 默认底模与训练输出
-DEFAULT_MODEL_ID = "../models/Qwen3-8B"  # 可替换为其他模型
+DEFAULT_MODEL_ID = str(ROOT / "models" / "Qwen3-8B")  # 可替换为其他模型
 DEFAULT_OUT_DIR = str(ROOT / "outputs" / "exp_default")
 
 # 全局缺省

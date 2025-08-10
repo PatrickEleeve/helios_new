@@ -33,10 +33,8 @@ class EdgeAdapter(nn.Module):
 
     @staticmethod
     def _causal_mask(T: int, device: torch.device) -> torch.Tensor:
-        # 形状[T,T]，上三角为 -inf，兼容 nn.Transformer 的 attn_mask 语义
-        mask = torch.full((T, T), float("-inf"), device=device)
-        mask = torch.triu(mask, diagonal=1)
-        return mask
+        # 形状[T,T]，上三角为 True（需要mask）。使用 bool 与 src_key_padding_mask 类型一致，避免警告。
+        return torch.triu(torch.ones((T, T), dtype=torch.bool, device=device), diagonal=1)
 
     @staticmethod
     def _key_padding_mask(attention_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -56,16 +54,10 @@ class EdgeAdapter(nn.Module):
         src_hidden: torch.Tensor,            # [B, T, C_src]
         attention_mask: Optional[torch.Tensor] = None,  # [B,T] 或 [B,1,1,T]
     ) -> torch.Tensor:
-        # 懒移动到输入张量的设备/精度，以兼容 device_map="auto"
-        dev, dt = src_hidden.device, src_hidden.dtype
-        if next(self.parameters(), None) is not None:
-            p = next(self.parameters())
-            if p.device != dev or p.dtype != dt:
-                self.to(device=dev, dtype=dt)
-
         x = self.proj(src_hidden)            # [B, T, C_dst]
         B, T, _ = x.shape
         attn_mask = self._causal_mask(T, x.device)
         kpm = self._key_padding_mask(attention_mask)
-        x = self.enc(x, mask=attn_mask, src_key_padding_mask=kpm)  # [B,T,C_dst]
+        # PyTorch TransformerEncoderLayer expects src_mask (not 'mask')
+        x = self.enc(x, src_mask=attn_mask, src_key_padding_mask=kpm)  # [B,T,C_dst]
         return self.norm(x)

@@ -54,6 +54,7 @@ class TrainConfig:
     # 模型与数据
     model_id: str = DEFAULT_MODEL_ID
     max_seq_len: int = 1024
+    middle_nodes: int = 2  # 可选: 仅用于某些简化/对比实验；HeliosArchitecture 当前未使用
 
     # 训练
     epochs: int = 1

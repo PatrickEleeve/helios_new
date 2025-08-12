@@ -61,3 +61,19 @@ class EdgeAdapter(nn.Module):
         # PyTorch TransformerEncoderLayer expects src_mask (not 'mask')
         x = self.enc(x, src_mask=attn_mask, src_key_padding_mask=kpm)  # [B,T,C_dst]
         return self.norm(x)
+
+    def init_near_identity(self):
+        if isinstance(self.proj, nn.Linear):
+            with torch.no_grad():
+                if self.proj.weight.shape[0] == self.proj.weight.shape[1]:
+                    nn.init.eye_(self.proj.weight)
+                else:
+                    nn.init.orthogonal_(self.proj.weight)
+        with torch.no_grad():
+            for p in self.enc.parameters():
+                if p.dim() >= 2:
+                    p.mul_(0.0)
+                else:
+                    p.zero_()
+            self.norm.weight.fill_(1.0)
+            self.norm.bias.zero_()

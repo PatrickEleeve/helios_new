@@ -38,6 +38,7 @@ class HeliosArchitecture(nn.Module):
         edge_dropout: float = 0.0,
         # 新增：是否对 Analyst 启用“分区掩码”
         enforce_analyst_section_masks: bool = True,
+        edge_identity_init: bool = False,
     ):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
@@ -127,6 +128,24 @@ class HeliosArchitecture(nn.Module):
 
         self._place_custom_modules()
 
+        if edge_identity_init:
+            modules = []
+            modules.extend(list(self.edge_src_to_analyst.values()))
+            modules.extend(list(self.edge_analyst_to_bull.values()))
+            modules.extend(list(self.edge_analyst_to_bear.values()))
+            modules.append(self.edge_bull_to_bear)
+            modules.append(self.edge_bear_to_bull)
+            modules.append(self.edge_bull_to_trader)
+            modules.append(self.edge_bear_to_trader)
+            modules.extend(list(self.edge_analyst_to_trader.values()))
+            modules.extend(list(self.edge_trader_to_risk.values()))
+            modules.extend(list(self.edge_risk_pair.values()))
+            modules.append(self.edge_trader_to_fm)
+            modules.append(self.edge_riskmix_to_fm)
+            for m in modules:
+                if hasattr(m, "init_near_identity"):
+                    m.init_near_identity()
+
     # 设备/精度对齐
     def _place_custom_modules(self):
         dev = self.core.embed_tokens.weight.device
@@ -151,8 +170,13 @@ class HeliosArchitecture(nn.Module):
         约定：标签格式为独立 token（例如 [FUND]），段落覆盖从该标签到下一个标签/结尾为止。
         """
         B, T = input_ids.shape
-        tags = {k: self.tokenizer.encode(v, add_special_tokens=False)[0] for k, v in SECTION_TAGS.items()}
-        spans = {k: [] for k in tags.keys()}
+        # Normalize keys to strings to avoid Enum-vs-str mismatches later.
+        # Keys become: "ANALYST_FUND", "ANALYST_SENT", ..., "SNAPSHOT"
+        def _key_name(k: Role | str) -> str:
+            return k.name if isinstance(k, Role) else str(k)
+
+        tags = {_key_name(k): self.tokenizer.encode(v, add_special_tokens=False)[0] for k, v in SECTION_TAGS.items()}
+        spans: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]] = {k: [] for k in tags.keys()}
 
         # 先找到每个位置是否为任一标签
         tag_pos = {k: (input_ids == tid) for k, tid in tags.items()}  # [B,T] bool
@@ -196,13 +220,9 @@ class HeliosArchitecture(nn.Module):
             (Role.ANALYST_NEWS, "ANALYST_NEWS"),
             (Role.ANALYST_TECH, "ANALYST_TECH"),
         ]:
-            # 映射 tag key
-            tag_key = role
-            tag_name = tag_key  # Role → key
-            # 取对应段；若为空则用 SNAPSHOT 段
-            role_tag = SECTION_TAGS[role]
-            m_role = make_mask(role_tag.strip("[]"))
-            # 兼容：上面 make_mask 用 key 名，这里做一次 fallback
+            # 使用标准化后的字符串键（与 _find_section_spans 对齐）
+            m_role = make_mask(tag)
+            # 若该段不存在则回退到 SNAPSHOT 段
             if not m_role.any():
                 m_role = snap_m
             # 应用 attention_mask（pad 位置强制0）
@@ -339,14 +359,14 @@ class HeliosArchitecture(nn.Module):
         return out
 
     # 与 trainer/evaluate_text 兼容
-    def compute_lm_loss(self, input_ids, labels, attention_mask=None, position_ids=None, ignore_index=None):
+    def compute_lm_loss(self, input_ids, labels, attention_mask=None, position_ids=None, ignore_index=None, label_smoothing: float = 0.0):
         if ignore_index is None:
             ignore_index = self.tokenizer.pad_token_id
         out = self.forward(input_ids, attention_mask=attention_mask, position_ids=position_ids)
         logits = out["logits"]
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
-        loss = nn.CrossEntropyLoss(ignore_index=ignore_index)(
+        loss = nn.CrossEntropyLoss(ignore_index=ignore_index, label_smoothing=label_smoothing)(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
         return loss, logits

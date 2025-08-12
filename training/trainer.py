@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from training.eval_metrics import parse_decision
 
 # 依赖你的架构实现
 from helios.architecture import HeliosArchitecture, DEFAULT_MODEL_ID
@@ -96,6 +97,13 @@ class TrainConfig:
     use_edges: bool = True
     # 内存优化
     gradient_checkpointing: bool = True
+    # 稳定性与损失
+    edge_identity_init: bool = False
+    label_smoothing: float = 0.0
+    # 决策排名评估（可选）
+    eval_rank_choices: Optional[str] = None  # 逗号分隔，如 "BUY,HOLD,SELL"
+    eval_rank_prefix: str = "Decision:"
+    eval_rank_length_norm: bool = False
 
 def set_seed(seed: int):
     random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -182,6 +190,8 @@ class Trainer:
             trust_remote_code=cfg.trust_remote_code,
             flow=flow,
             gradient_checkpointing=cfg.gradient_checkpointing,
+            edge_dropout=0.0,
+            edge_identity_init=cfg.edge_identity_init,
         )
         self.tok = self.arch.tokenizer
 
@@ -190,6 +200,7 @@ class Trainer:
         self.eval_dl = None
         if eval_texts:
             self.eval_dl = DataLoader(LMDataset(eval_texts), batch_size=cfg.eval_bs, shuffle=False, drop_last=False, num_workers=2, collate_fn=collate)
+        self._eval_texts: Optional[List[str]] = eval_texts
 
         self._optim_mode = "edges_only" if cfg.phase1_edges_only else "mixed"
         self.optimizer = self._build_optimizer(self._optim_mode)
@@ -307,6 +318,12 @@ class Trainer:
                 if self.eval_dl is not None and step % cfg.eval_every == 0:
                     val = self.evaluate()
                     print(f"[eval] step {step} ppl={math.exp(val):.2f} loss={val:.4f}")
+                    if self._eval_texts is not None and self.cfg.eval_rank_choices:
+                        try:
+                            acc = self.evaluate_rank()
+                            print(f"[eval|rank] step {step} acc={acc:.3f} choices={self.cfg.eval_rank_choices}")
+                        except Exception as e:
+                            print(f"[warn] rank eval failed: {e}")
                     if val < best_eval:
                         best_eval = val
                         self.ckpt.save(self._make_payload(step, {"val_loss": val}), step)
@@ -335,7 +352,13 @@ class Trainer:
             ctx = _NoOp()
 
         with ctx:
-            loss, _ = self.arch.compute_lm_loss(input_ids=input_ids, labels=labels, attention_mask=attn, ignore_index=self.tok.pad_token_id)
+            loss, _ = self.arch.compute_lm_loss(
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=attn,
+                ignore_index=self.tok.pad_token_id,
+                label_smoothing=self.cfg.label_smoothing,
+            )
             loss = loss / self.cfg.grad_accum
 
         if self.cfg.dtype == "fp16":
@@ -368,12 +391,62 @@ class Trainer:
             labels = batch["labels"].to(cfg.device, non_blocking=True)
             attn = batch.get("attention_mask", None)
             if attn is not None: attn = attn.to(cfg.device, non_blocking=True)
-            loss, _ = self.arch.compute_lm_loss(input_ids=input_ids, labels=labels, attention_mask=attn, ignore_index=self.arch.tokenizer.pad_token_id)
+            loss, _ = self.arch.compute_lm_loss(
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=attn,
+                ignore_index=self.arch.tokenizer.pad_token_id,
+                label_smoothing=self.cfg.label_smoothing,
+            )
             n_tok = (labels[:, 1:] != self.arch.tokenizer.pad_token_id).sum().item()
             total_loss += loss.item() * n_tok; total_tokens += n_tok
         self.arch.train()
         if total_tokens == 0: return float("inf")
         return total_loss / total_tokens
+
+    @torch.no_grad()
+    def evaluate_rank(self) -> float:
+        assert self._eval_texts is not None
+        choices = [c.strip() for c in (self.cfg.eval_rank_choices or "").split(",") if c.strip()]
+        if not choices:
+            return float('nan')
+        device = self.cfg.device
+        self.arch.eval()
+        correct = 0
+        total = 0
+        tok = self.tok
+        for text in self._eval_texts:
+            gold = parse_decision(text)
+            if gold not in choices:
+                continue
+            if self.cfg.eval_rank_prefix in text:
+                prompt = text.split(self.cfg.eval_rank_prefix, 1)[0] + self.cfg.eval_rank_prefix
+            else:
+                prompt = text
+            base = tok(prompt, return_tensors="pt")
+            base_ids = base["input_ids"].to(device)
+            base_attn = base["attention_mask"].to(device)
+            scores = []
+            for ch in choices:
+                ch_ids = tok(" " + ch, add_special_tokens=False, return_tensors="pt")["input_ids"][0].to(device)
+                ctx_ids = base_ids.clone(); ctx_attn = base_attn.clone()
+                logp = 0.0
+                for tid in ch_ids:
+                    out = self.arch.forward(input_ids=ctx_ids, attention_mask=ctx_attn)["logits"]
+                    lp = torch.log_softmax(out[:, -1, :], dim=-1)
+                    logp += lp[0, int(tid)].item()
+                    tid_ = tid.view(1,1)
+                    ctx_ids = torch.cat([ctx_ids, tid_.to(ctx_ids.device)], dim=1)
+                    one = torch.ones((ctx_attn.size(0),1), dtype=ctx_attn.dtype, device=ctx_attn.device)
+                    ctx_attn = torch.cat([ctx_attn, one], dim=1)
+                if self.cfg.eval_rank_length_norm and len(ch_ids) > 0:
+                    logp = logp / len(ch_ids)
+                scores.append(logp)
+            pred = choices[int(torch.tensor(scores).argmax().item())]
+            correct += int(pred == gold)
+            total += 1
+        self.arch.train()
+        return correct / max(1, total)
 
 def run_training(train_file: str, eval_file: Optional[str] = None, field: Optional[str] = None, cfg: Optional[TrainConfig] = None):
     cfg = cfg or TrainConfig()

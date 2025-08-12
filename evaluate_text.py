@@ -77,11 +77,19 @@ def split_prompt(text: str, prefer_prefix: Optional[str]) -> Tuple[str, Optional
         return (pre + "Answer:", post.strip(), "answer")
     return (t, None, None)
 
+def _pick_device() -> str:
+    try:
+        import torch as _t
+        return "cuda" if _t.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
 def greedy_decode(arch: HeliosArchitecture, prompt: str, max_new: int = 64) -> str:
     tok = arch.tokenizer
     enc = tok(prompt, return_tensors="pt")
-    input_ids = enc["input_ids"].to("cuda")
-    attn = enc["attention_mask"].to("cuda")
+    dev = _pick_device()
+    input_ids = enc["input_ids"].to(dev)
+    attn = enc["attention_mask"].to(dev)
     out_ids = arch.greedy_decode(input_ids, max_new_tokens=max_new, attention_mask=attn)
     full = tok.decode(out_ids[0], skip_special_tokens=True)
     tail = full.split(prompt, 1)[1].strip() if prompt in full else full
@@ -94,11 +102,12 @@ def rank_choices(arch: HeliosArchitecture, prompt: str, choices: List[str], scor
     """
     tok = arch.tokenizer
     base = tok(prompt, return_tensors="pt")
-    base_ids = base["input_ids"].to("cuda")
-    base_attn = base["attention_mask"].to("cuda")
+    dev = _pick_device()
+    base_ids = base["input_ids"].to(dev)
+    base_attn = base["attention_mask"].to(dev)
     scores = []
     for ch in choices:
-        ch_ids = tok(" " + ch, add_special_tokens=False, return_tensors="pt")["input_ids"][0].to("cuda")
+        ch_ids = tok(" " + ch, add_special_tokens=False, return_tensors="pt")["input_ids"][0].to(dev)
         ctx_ids = base_ids.clone(); ctx_attn = base_attn.clone()
         logp = 0.0
         for tid in ch_ids:
@@ -119,8 +128,9 @@ def rank_choices(arch: HeliosArchitecture, prompt: str, choices: List[str], scor
 def constrained_first_token(arch: HeliosArchitecture, prompt: str, choices: List[str]) -> str:
     tok = arch.tokenizer
     enc = tok(prompt, return_tensors="pt")
-    input_ids = enc["input_ids"].to("cuda")
-    attn = enc["attention_mask"].to("cuda")
+    dev = _pick_device()
+    input_ids = enc["input_ids"].to(dev)
+    attn = enc["attention_mask"].to(dev)
     allowed = []
     for ch in choices:
         ids = tok(" " + ch, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
@@ -207,7 +217,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 

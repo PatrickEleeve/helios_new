@@ -9,6 +9,14 @@ import glob
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Iterable
 
+import sys
+import os
+
+# Add the project root to the Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -456,4 +464,38 @@ def run_training(train_file: str, eval_file: Optional[str] = None, field: Option
     print(f"[data] train={len(train_texts)}  eval={0 if eval_texts is None else len(eval_texts)}")
     print(f"[cfg] {cfg}")
     trainer = Trainer(cfg, train_texts, eval_texts)
+    trainer.train()
+
+def main(train_cfg: TrainConfig, helios_cfg, train_files: List[str], val_files: List[str]):
+    """主训练函数
+
+    - 汇总多个训练/验证文件的数据
+    - 构建 Trainer 并启动两阶段训练（先边后顶点）
+
+    说明：helios_cfg 参数当前未使用（Trainer 会基于 TrainConfig 自行构造 FlowConfig），
+    为向后兼容保留该参数位。
+    """
+    os.makedirs(train_cfg.out_dir, exist_ok=True)
+
+    # 读取并汇总数据
+    train_texts: List[str] = []
+    for fp in (train_files or []):
+        try:
+            train_texts.extend(load_texts_from_file(fp))
+        except Exception as e:
+            print(f"[warn] failed to load train file {fp}: {e}")
+
+    eval_texts: Optional[List[str]] = []
+    for fp in (val_files or []):
+        try:
+            eval_texts.extend(load_texts_from_file(fp))
+        except Exception as e:
+            print(f"[warn] failed to load val file {fp}: {e}")
+    if eval_texts == []:
+        eval_texts = None
+
+    print(f"[data] train={len(train_texts)}  eval={0 if eval_texts is None else len(eval_texts)}")
+    print(f"[cfg] {train_cfg}")
+
+    trainer = Trainer(train_cfg, train_texts, eval_texts)
     trainer.train()
